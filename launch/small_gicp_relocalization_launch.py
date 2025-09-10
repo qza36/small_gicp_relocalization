@@ -43,6 +43,7 @@ def generate_launch_description():
                 "base_frame": "",
                 "lidar_frame": "",
                 "prior_pcd_file": "",
+                "enable_service": True,
             }
         ],
     )

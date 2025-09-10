@@ -19,6 +19,8 @@
 #include "small_gicp/pcl/pcl_registration.hpp"
 #include "small_gicp/util/downsampling_omp.hpp"
 #include "tf2_eigen/tf2_eigen.hpp"
+#include "std_srvs/srv/trigger.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 
 namespace small_gicp_relocalization
 {
@@ -40,6 +42,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("lidar_frame", "");
   this->declare_parameter("prior_pcd_file", "");
   this->declare_parameter("init_pose", std::vector<double>{0., 0., 0., 0., 0., 0.});
+  this->declare_parameter("enable_service",false);
 
   this->get_parameter("num_threads", num_threads_);
   this->get_parameter("num_neighbors", num_neighbors_);
@@ -53,15 +56,26 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("lidar_frame", lidar_frame_);
   this->get_parameter("prior_pcd_file", prior_pcd_file_);
   this->get_parameter("init_pose", init_pose_);
+  this->get_parameter("enable_service",enable_service);
 
   // [x, y, z, roll, pitch, yaw] - init_pose parameters
-  if (!init_pose_.empty() && init_pose_.size() >= 6) {
+  if (!init_pose_.empty() && init_pose_.size() >= 6 && !enable_service) {
     result_t_.translation() << init_pose_[0], init_pose_[1], init_pose_[2];
     result_t_.linear() =
       Eigen::AngleAxisd(init_pose_[5], Eigen::Vector3d::UnitZ()) *
       Eigen::AngleAxisd(init_pose_[4], Eigen::Vector3d::UnitY()) *
       Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()).toRotationMatrix();
   }
+
+  if (enable_service) {
+    service_ = this->create_service<std_srvs::srv::Trigger>(
+      "relocalization",
+      std::bind(&SmallGicpRelocalizationNode::ServiceCallback,this,std::placeholders::_1,std::placeholders::_2));
+    pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+  "/Odometry",10,
+std::bind(&SmallGicpRelocalizationNode::OdomCallback,this,std::placeholders::_1));
+  }
+
   previous_result_t_ = result_t_;
 
   accumulated_cloud_ = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
@@ -91,17 +105,19 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     "registered_scan", 10,
     std::bind(&SmallGicpRelocalizationNode::registeredPcdCallback, this, std::placeholders::_1));
 
-  initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
+  if (!enable_service) {
+    initial_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
     "initialpose", 10,
     std::bind(&SmallGicpRelocalizationNode::initialPoseCallback, this, std::placeholders::_1));
 
-  register_timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(500),  // 2 Hz
-    std::bind(&SmallGicpRelocalizationNode::performRegistration, this));
+    register_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(500),  // 2 Hz
+      std::bind(&SmallGicpRelocalizationNode::performRegistration, this));
 
-  transform_timer_ = this->create_wall_timer(
-    std::chrono::milliseconds(50),  // 20 Hz
-    std::bind(&SmallGicpRelocalizationNode::publishTransform, this));
+    transform_timer_ = this->create_wall_timer(
+      std::chrono::milliseconds(50),  // 20 Hz
+      std::bind(&SmallGicpRelocalizationNode::publishTransform, this));
+  }
 }
 
 void SmallGicpRelocalizationNode::loadGlobalMap(const std::string & file_name)
@@ -203,6 +219,28 @@ void SmallGicpRelocalizationNode::publishTransform()
 
   tf_broadcaster_->sendTransform(transform_stamped);
 }
+
+void SmallGicpRelocalizationNode::ServiceCallback(
+  const std::shared_ptr<std_srvs::srv::Trigger::Request> request,
+  std::shared_ptr<std_srvs::srv::Trigger::Response> response)
+{
+  RCLCPP_INFO(this->get_logger(),"\033[33mReceivce Relocalization Request\033[0m");
+  performRegistration();
+  publishTransform();
+}
+
+void SmallGicpRelocalizationNode::OdomCallback(const std::shared_ptr<const nav_msgs::msg::Odometry>& odom)
+{
+  if (!odom) {
+    RCLCPP_WARN(this->get_logger(), "Received null odometry message");
+    return;
+  }
+  result_t_.translation() << odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z;
+
+  const auto &q = odom->pose.pose.orientation;
+  result_t_.linear() = Eigen::Quaterniond(q.w,q.x,q.y,q.z).toRotationMatrix();
+}
+
 
 void SmallGicpRelocalizationNode::initialPoseCallback(
   const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg)

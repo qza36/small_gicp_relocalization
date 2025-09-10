@@ -31,6 +31,8 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
+#include "std_srvs/srv/trigger.hpp"
+#include "nav_msgs/msg/odometry.hpp"
 
 namespace small_gicp_relocalization
 {
@@ -46,15 +48,19 @@ private:
   void performRegistration();
   void publishTransform();
   void initialPoseCallback(const geometry_msgs::msg::PoseWithCovarianceStamped::SharedPtr msg);
+  void ServiceCallback(const std::shared_ptr<std_srvs::srv::Trigger::Request> request,std::shared_ptr<std_srvs::srv::Trigger::Response> response);
+  void OdomCallback(const std::shared_ptr<const nav_msgs::msg::Odometry>& odom);
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr pcd_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseWithCovarianceStamped>::SharedPtr initial_pose_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_sub_;
 
   int num_threads_;
   int num_neighbors_;
   float global_leaf_size_;
   float registered_leaf_size_;
   float max_dist_sq_;
+  bool enable_service;
   std::vector<double> init_pose_;
 
   std::string map_frame_;
@@ -82,6 +88,8 @@ private:
 
   rclcpp::TimerBase::SharedPtr transform_timer_;
   rclcpp::TimerBase::SharedPtr register_timer_;
+
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr service_;
 
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
