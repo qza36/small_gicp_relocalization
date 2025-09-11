@@ -44,6 +44,7 @@ def generate_launch_description():
                 "lidar_frame": "",
                 "prior_pcd_file": "",
                 "enable_service": True,
+                "max_accumulated_scans": 100, #service 模式下配准用点云:100个扫描×1000点=100,000点
             }
         ],
     )

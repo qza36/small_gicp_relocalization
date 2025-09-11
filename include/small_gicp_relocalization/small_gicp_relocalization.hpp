@@ -62,6 +62,7 @@ private:
   float max_dist_sq_;
   bool enable_service;
   std::vector<double> init_pose_;
+  int max_accumulated_scans_;
 
   std::string map_frame_;
   std::string odom_frame_;
@@ -73,6 +74,10 @@ private:
   rclcpp::Time last_scan_time_;
   Eigen::Isometry3d result_t_;
   Eigen::Isometry3d previous_result_t_;
+  Eigen::Isometry3d current_pose_t_;
+  Eigen::Isometry3d initial_pose_t_;
+  Eigen::Isometry3d initial_odom_pose_;
+  bool has_initial_odom_;
 
   pcl::PointCloud<pcl::PointXYZ>::Ptr global_map_;
   pcl::PointCloud<pcl::PointXYZ>::Ptr registered_scan_;

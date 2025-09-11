@@ -28,7 +28,9 @@ namespace small_gicp_relocalization
 SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptions & options)
 : Node("small_gicp_relocalization", options),
   result_t_(Eigen::Isometry3d::Identity()),
-  previous_result_t_(Eigen::Isometry3d::Identity())
+  previous_result_t_(Eigen::Isometry3d::Identity()),
+  initial_odom_pose_(Eigen::Isometry3d::Identity()),
+  has_initial_odom_(false)
 {
   this->declare_parameter("num_threads", 4);
   this->declare_parameter("num_neighbors", 20);
@@ -43,6 +45,7 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->declare_parameter("prior_pcd_file", "");
   this->declare_parameter("init_pose", std::vector<double>{0., 0., 0., 0., 0., 0.});
   this->declare_parameter("enable_service",false);
+  this->declare_parameter("max_accumulated_scans", 50);
 
   this->get_parameter("num_threads", num_threads_);
   this->get_parameter("num_neighbors", num_neighbors_);
@@ -57,11 +60,18 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
   this->get_parameter("prior_pcd_file", prior_pcd_file_);
   this->get_parameter("init_pose", init_pose_);
   this->get_parameter("enable_service",enable_service);
+  this->get_parameter("max_accumulated_scans", max_accumulated_scans_);
 
   // [x, y, z, roll, pitch, yaw] - init_pose parameters
   if (!init_pose_.empty() && init_pose_.size() >= 6 && !enable_service) {
     result_t_.translation() << init_pose_[0], init_pose_[1], init_pose_[2];
     result_t_.linear() =
+      Eigen::AngleAxisd(init_pose_[5], Eigen::Vector3d::UnitZ()) *
+      Eigen::AngleAxisd(init_pose_[4], Eigen::Vector3d::UnitY()) *
+      Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()).toRotationMatrix();
+  }else {
+    initial_pose_t_.translation() << init_pose_[0], init_pose_[1], init_pose_[2];
+    initial_pose_t_.linear() =
       Eigen::AngleAxisd(init_pose_[5], Eigen::Vector3d::UnitZ()) *
       Eigen::AngleAxisd(init_pose_[4], Eigen::Vector3d::UnitY()) *
       Eigen::AngleAxisd(init_pose_[3], Eigen::Vector3d::UnitX()).toRotationMatrix();
@@ -71,10 +81,10 @@ SmallGicpRelocalizationNode::SmallGicpRelocalizationNode(const rclcpp::NodeOptio
     service_ = this->create_service<std_srvs::srv::Trigger>(
       "relocalization",
       std::bind(&SmallGicpRelocalizationNode::ServiceCallback,this,std::placeholders::_1,std::placeholders::_2));
-    pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-  "/Odometry",10,
-std::bind(&SmallGicpRelocalizationNode::OdomCallback,this,std::placeholders::_1));
   }
+  pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
+    "/Odometry",10,
+    std::bind(&SmallGicpRelocalizationNode::OdomCallback,this,std::placeholders::_1));
 
   previous_result_t_ = result_t_;
 
@@ -157,6 +167,28 @@ void SmallGicpRelocalizationNode::registeredPcdCallback(
   pcl::PointCloud<pcl::PointXYZ>::Ptr scan(new pcl::PointCloud<pcl::PointXYZ>());
   pcl::fromROSMsg(*msg, *scan);
   *accumulated_cloud_ += *scan;
+  
+  // 在服务模式下，限制累积点云的大小以防止内存溢出
+  if (enable_service && accumulated_cloud_->size() > static_cast<size_t>(max_accumulated_scans_ * 1000)) {
+    // 保留最新的点云数据，删除较老的数据
+    pcl::PointCloud<pcl::PointXYZ>::Ptr temp_cloud(new pcl::PointCloud<pcl::PointXYZ>());
+    size_t target_size = max_accumulated_scans_ * 800; // 保留80%的数据
+    size_t start_index = accumulated_cloud_->size() - target_size;
+
+    //  FIFO 策略
+    temp_cloud->points.assign(
+      accumulated_cloud_->points.begin() + start_index, 
+      accumulated_cloud_->points.end());
+    temp_cloud->width = temp_cloud->points.size();
+    temp_cloud->height = 1;
+    temp_cloud->is_dense = accumulated_cloud_->is_dense;
+    
+    accumulated_cloud_ = temp_cloud;
+    
+    RCLCPP_WARN(this->get_logger(), 
+      "Accumulated cloud size exceeded limit, trimmed to %zu points", 
+      accumulated_cloud_->size());
+  }
 }
 
 void SmallGicpRelocalizationNode::performRegistration()
@@ -225,6 +257,7 @@ void SmallGicpRelocalizationNode::ServiceCallback(
   std::shared_ptr<std_srvs::srv::Trigger::Response> response)
 {
   RCLCPP_INFO(this->get_logger(),"\033[33mReceivce Relocalization Request\033[0m");
+  accumulated_cloud_->clear();
   performRegistration();
   publishTransform();
 }
@@ -235,10 +268,25 @@ void SmallGicpRelocalizationNode::OdomCallback(const std::shared_ptr<const nav_m
     RCLCPP_WARN(this->get_logger(), "Received null odometry message");
     return;
   }
-  result_t_.translation() << odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z;
-
+  
+  // 将里程计数据转换为 Eigen::Isometry3d
+  current_pose_t_.translation() << odom->pose.pose.position.x, odom->pose.pose.position.y, odom->pose.pose.position.z;
   const auto &q = odom->pose.pose.orientation;
-  result_t_.linear() = Eigen::Quaterniond(q.w,q.x,q.y,q.z).toRotationMatrix();
+  current_pose_t_.linear() = Eigen::Quaterniond(q.w,q.x,q.y,q.z).toRotationMatrix();
+  
+  // 如果是第一次接收里程计数据，记录为初始里程计位姿
+  if (!has_initial_odom_) {
+    initial_odom_pose_ = current_pose_t_;
+    has_initial_odom_ = true;
+    RCLCPP_INFO(this->get_logger(), "Recorded initial odometry pose");
+    return;
+  }
+  
+  // 计算里程计的相对变化（从初始位置到当前位置）
+  Eigen::Isometry3d odom_delta = initial_odom_pose_.inverse() * current_pose_t_;
+  
+  // 将里程计的相对变化叠加到初始地图位姿上，作为配准的初始猜测
+  previous_result_t_ = initial_pose_t_ * odom_delta;
 }
 
 
